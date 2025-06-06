@@ -34,6 +34,12 @@ import android.Manifest;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
+import android.bluetooth.BluetoothGattService;
+import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothSocket;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -42,6 +48,8 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.support.v4.app.ActivityCompat;
+import android.util.Log;
+
 
 import com.uzmap.pkg.uzcore.UZWebView;
 import com.uzmap.pkg.uzcore.uzmodule.UZModule;
@@ -58,6 +66,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.UUID;
 
 /**
@@ -81,6 +91,12 @@ public class BluetoothSerial extends UZModule {
     private static StringBuffer receiveDataStr = new StringBuffer();//接收到的数据字符成
     private long lastInteractiveTime = 0;//上次数据交互时间
     private boolean isReturnHex = false;//是否返回hex
+    private static BluetoothGatt bluetoothGatt; // BLE蓝牙
+    private static BluetoothGattCharacteristic writableCharacteristic;
+    private static BluetoothGattCharacteristic notifyCharacteristic;
+    private static int bleReadThreshold = 256;
+    private final StringBuilder bleDataBuffer = new StringBuilder();
+    public static UZModuleContext myContent;
 
     public BluetoothSerial(UZWebView webView) {
         super(webView);
@@ -119,6 +135,7 @@ public class BluetoothSerial extends UZModule {
         JSONObject ret = new JSONObject();
         try {
             ret.put("state", state);
+            ret.put("code", 1);
         } catch (JSONException e1) {
             e1.printStackTrace();
         }
@@ -448,6 +465,7 @@ public class BluetoothSerial extends UZModule {
                         try {
                             map.put("name", device.getName());
                             map.put("address", device.getAddress());
+                            map.put("type", device.getType());
                         } catch (JSONException e) {
                             e.printStackTrace();
                         }
@@ -516,7 +534,9 @@ public class BluetoothSerial extends UZModule {
      */
     public void jsmethod_connect(final UZModuleContext moduleContext) {
         try {
+            myContent = moduleContext;
             final String address = moduleContext.optString("address");
+            int chooseConnetType = moduleContext.optInt("type");
             if (address == null || address.isEmpty()) {
                 error(moduleContext, 0, "未获取到蓝牙连接地址");
                 return;
@@ -533,31 +553,116 @@ public class BluetoothSerial extends UZModule {
                 readThreadState = false;
             }
 
-            connDeviceThread = new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        device = btAdapter.getRemoteDevice(address);
-                        btSocket = device.createRfcommSocketToServiceRecord(MY_UUID);
-                    } catch (Exception e) {
-                        error(moduleContext, 1, "创建socket失败");
-                        return;
-                    }
-                    try {
-                        btSocket.connect();
-                        btOutStream = btSocket.getOutputStream();
-                        successState(moduleContext, true);
-                    } catch (Exception e) {
-                        closeBtSocket();
-                        error(moduleContext, 2, "连接失败");
-                    }
-                    connDeviceThread = null;
-                }
-            });
-            connDeviceThread.start();
+            device = btAdapter.getRemoteDevice(address);
+            if (device == null) {
+                error(moduleContext, 1, "无法获取设备对象");
+                return;
+            }
+            int type = device.getType();
+            if (type == BluetoothDevice.DEVICE_TYPE_LE || (type == BluetoothDevice.DEVICE_TYPE_DUAL && chooseConnetType == BluetoothDevice.DEVICE_TYPE_LE)) {
+                connectBLE(device, moduleContext);
+            } else if (type == BluetoothDevice.DEVICE_TYPE_CLASSIC || (type == BluetoothDevice.DEVICE_TYPE_DUAL && chooseConnetType == BluetoothDevice.DEVICE_TYPE_CLASSIC)) {
+                connectClassic(device, moduleContext);
+            } else if (type == BluetoothDevice.DEVICE_TYPE_DUAL) {
+                connectBLE(device, moduleContext);
+            } else {
+                error(moduleContext, -1, "未知蓝牙类型");
+            }
         } catch (Exception e) {
             error(moduleContext, -1, e.getMessage());
         }
+    }
+
+    private void connectClassic(BluetoothDevice device, final UZModuleContext moduleContext) {
+        new Thread(() -> {
+            try {
+                btSocket = device.createRfcommSocketToServiceRecord(
+                        UUID.fromString("00001101-0000-1000-8000-00805F9B34FB"));
+                btSocket.connect();
+                btOutStream = btSocket.getOutputStream();
+                successState(moduleContext, true);
+            } catch (Exception e) {
+                closeBtSocket();
+                error(moduleContext, 2, "经典蓝牙连接失败: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    private void connectBLE(BluetoothDevice device, final UZModuleContext moduleContext) {
+        bluetoothGatt = device.connectGatt(mContext, false, new BluetoothGattCallback() {
+            @Override
+            public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    gatt.discoverServices();
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    error(moduleContext, 3, "BLE已断开");
+                }
+            }
+
+            @Override
+            public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+                for (BluetoothGattService service : gatt.getServices()) {
+                    for (BluetoothGattCharacteristic characteristic : service.getCharacteristics()) {
+                        if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE) > 0) {
+                            writableCharacteristic = characteristic;
+                        }
+                        if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) > 0) {
+                            notifyCharacteristic = characteristic;
+                            gatt.setCharacteristicNotification(notifyCharacteristic, true);
+
+                            BluetoothGattDescriptor descriptor = notifyCharacteristic.getDescriptor(
+                                    UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"));
+                            if (descriptor != null) {
+                                descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                                gatt.writeDescriptor(descriptor);
+                            }
+                        }
+                    }
+                }
+                if (writableCharacteristic != null) {
+                    successState(moduleContext, true);
+                } else {
+                    error(moduleContext, 4, "BLE未发现可写特征");
+                }
+            }
+
+            @Override
+            public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+                byte[] data = characteristic.getValue();
+                if (data != null && data.length > 0) {
+                    lastInteractiveTime = System.currentTimeMillis();
+                    if (isReturnHex) {
+                        bleDataBuffer.append(Hex2Str(data).toString());
+                    } else {
+                        bleDataBuffer.append(new String(data));
+                    }
+                    while (bleDataBuffer.length() >= bleReadThreshold) {
+                        String chunk = bleDataBuffer.substring(0, bleReadThreshold);
+                        bleDataBuffer.delete(0, bleReadThreshold);
+                        try {
+                            dispatchNotifyToJS(chunk);
+                        } catch (Exception e) {
+                            Log.e("com.github.Rosinate", "读取BLE数据失败：" + e.getMessage());
+                        }
+                    }
+                }
+            }
+        });
+        // 启动定时器监控心跳超时数据返回
+        new Timer().schedule(new TimerTask() {
+            @Override
+            public void run() {
+                long now = System.currentTimeMillis();
+                if (bleDataBuffer.length() > 0 && now - lastInteractiveTime > 1000) {
+                    try {
+                        dispatchNotifyToJS(bleDataBuffer.toString());
+                        bleDataBuffer.setLength(0);
+                    } catch (Exception ignored) {
+                        Log.e("com.github.Rosinate", "启动定时器监控心跳超时数据返回失败：" + ignored.getMessage());
+                    }
+                }
+            }
+        }, 1000, 500);
     }
 
     /**
@@ -569,13 +674,15 @@ public class BluetoothSerial extends UZModule {
                 closeBtSocket();
                 btSocket = null;
             }
-            if (connDeviceThread != null) {
-                connDeviceThread.interrupt();
-                connDeviceThread = null;
-                readThreadState = false;
+            if (bluetoothGatt != null) {
+                bluetoothGatt.disconnect();
+                bluetoothGatt.close();
+                bluetoothGatt = null;
+                writableCharacteristic = null;
+                notifyCharacteristic = null;
             }
             device = null;
-            successState(moduleContext, true);
+            successState(moduleContext, false);
         } catch (Exception e) {
             error(moduleContext, -1, e.getMessage());
         }
@@ -632,34 +739,28 @@ public class BluetoothSerial extends UZModule {
      * 发送数据
      */
     public void jsmethod_sendData(final UZModuleContext moduleContext) {
-        try {
-            byte[] buffer = null;
-            String data = moduleContext.optString("data");//发送的数据
-            boolean isHex = moduleContext.optBoolean("isHex");//发送的数据
-            try {
-                if (isHex) {
-                    buffer = Str2Hex(data);
-                } else {
-                    buffer = data.getBytes();
-                }
-            } catch (Exception e) {
-                error(moduleContext, 0, "参数解析失败");
-                return;
-            }
+        String data = moduleContext.optString("data");
+        if (data == null || data.isEmpty()) {
+            error(moduleContext, 0, "待写入数据为空");
+            return;
+        }
 
-            if (btSocket != null) {
-                try {
-                    btOutStream.write(buffer);
-                    lastInteractiveTime = System.currentTimeMillis();
-                    successState(moduleContext, true);
-                } catch (IOException e) {
-                    error(moduleContext, 1, "发送失败");
-                }
+        byte[] bytes = data.getBytes();
+
+        try {
+            if (btSocket != null && btSocket.isConnected() && btOutStream != null) {
+                btOutStream.write(bytes);
+                btOutStream.flush();
+                successState(moduleContext, true);
+            } else if (bluetoothGatt != null && writableCharacteristic != null) {
+                writableCharacteristic.setValue(bytes);
+                bluetoothGatt.writeCharacteristic(writableCharacteristic);
+                successState(moduleContext, true);
             } else {
-                error(moduleContext, 2, "未获取到socket");
+                error(moduleContext, 2, "当前未建立有效连接");
             }
         } catch (Exception e) {
-            error(moduleContext, -1, e.getMessage());
+            error(moduleContext, -1, "写入失败: " + e.getMessage());
         }
     }
 
@@ -670,10 +771,12 @@ public class BluetoothSerial extends UZModule {
      */
     public void jsmethod_readData(final UZModuleContext moduleContext) {
         try {
+            myContent = moduleContext;
             int setBufferSize = moduleContext.optInt("bufferSize");
             if (setBufferSize == 0) {
                 setBufferSize = 256;
             }
+            bleReadThreshold = setBufferSize;
             isReturnHex = moduleContext.optBoolean("isReturnHex");
             final int bufferSize = setBufferSize;
             try {
@@ -684,7 +787,9 @@ public class BluetoothSerial extends UZModule {
             } catch (Exception ignored) {
 
             }
-            if (btSocket == null) {
+            if (bluetoothGatt != null) {
+                return;
+            } else if (btSocket == null) {
                 error(moduleContext, 0, "未连接到蓝牙设备");
                 return;
             }
@@ -801,6 +906,13 @@ public class BluetoothSerial extends UZModule {
             return new String(chars, 0, index);
         }
         return "";
+    }
+
+    private void dispatchNotifyToJS(String value) {
+        if (myContent != null)
+            successKeep(myContent, value);
+//            this.sendEventToHtml5("bluetoothData",ret);
+
     }
 
     /**
